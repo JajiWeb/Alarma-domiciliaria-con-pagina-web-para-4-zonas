@@ -1,0 +1,428 @@
+/*
+ * Sistema de Alarma ESP32 con Interfaz Web
+ * - 4 zonas con sensores digitales
+ * - 4 salidas (LED/Relé) independientes
+ * - Servidor web con WebSocket en tiempo real
+ */
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+// ===== Configuración WiFi =====
+const char* WIFI_SSID     = "TU_WIFI";
+const char* WIFI_PASSWORD = "TU_PASSWORD";
+
+// ===== Definición de Zonas =====
+#define NUM_ZONAS 4
+
+const int PIN_SENSOR[NUM_ZONAS] = {4, 16, 17, 18};   // Entradas
+const int PIN_SALIDA[NUM_ZONAS] = {5, 19, 21, 22};   // Salidas
+const char* NOMBRE_ZONA[NUM_ZONAS] = {
+  "Zona 1 - Entrada",
+  "Zona 2 - Pasillo",
+  "Zona 3 - Ventana",
+  "Zona 4 - Garage"
+};
+
+// ===== Parámetros =====
+const unsigned long TIEMPO_ALARMA   = 10000;  // ms que dura la alarma
+const unsigned long TIEMPO_DEBOUNCE = 50;     // ms antirrebote
+
+// ===== Variables de estado =====
+bool estadoZona[NUM_ZONAS]         = {false};
+bool ultimaLectura[NUM_ZONAS]      = {false};
+unsigned long tInicioAlarma[NUM_ZONAS] = {0};
+unsigned long tUltimoCambio[NUM_ZONAS] = {0};
+
+// ===== Servidores =====
+WebServer servidorWeb(80);
+WebSocketsServer webSocket(81);
+
+// ===== Página HTML =====
+const char PAGINA_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Panel de Alarma ESP32</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', Arial, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 {
+    text-align: center;
+    color: #38bdf8;
+    margin-bottom: 10px;
+    font-size: 1.8rem;
+  }
+  .subtitulo {
+    text-align: center;
+    color: #94a3b8;
+    margin-bottom: 25px;
+    font-size: 0.9rem;
+  }
+  .estado-conexion {
+    text-align: center;
+    padding: 8px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+    font-weight: bold;
+    display: inline-block;
+    width: 100%;
+  }
+  .conectado { background: #065f46; color: #6ee7b7; }
+  .desconectado { background: #7f1d1d; color: #fca5a5; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 15px;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  .zona {
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 20px;
+    border-left: 6px solid #334155;
+    transition: all 0.3s ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .zona.activa {
+    border-left-color: #ef4444;
+    background: #2a1a1a;
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
+    animation: pulso 1s infinite;
+  }
+  .zona.inactiva {
+    border-left-color: #22c55e;
+  }
+  @keyframes pulso {
+    0%, 100% { box-shadow: 0 0 20px rgba(239,68,68,0.4); }
+    50%      { box-shadow: 0 0 35px rgba(239,68,68,0.8); }
+  }
+  .zona h2 {
+    font-size: 1.05rem;
+    margin-bottom: 12px;
+    color: #cbd5e1;
+  }
+  .indicador {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+  .led {
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: #475569;
+    transition: all 0.3s;
+  }
+  .led.on { background: #ef4444; box-shadow: 0 0 12px #ef4444; }
+  .led.off { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .etiqueta {
+    font-size: 0.85rem;
+    color: #94a3b8;
+  }
+  .valor {
+    font-weight: bold;
+    font-size: 0.95rem;
+    color: #f1f5f9;
+    margin-left: auto;
+  }
+  .valor.alarma { color: #ef4444; }
+  .valor.normal { color: #22c55e; }
+
+  .historial {
+    max-width: 1100px;
+    margin: 30px auto 0;
+    background: #1e293b;
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .historial h2 {
+    color: #38bdf8;
+    margin-bottom: 12px;
+    font-size: 1.1rem;
+  }
+  #logEventos {
+    max-height: 200px;
+    overflow-y: auto;
+    font-family: 'Consolas', monospace;
+    font-size: 0.85rem;
+  }
+  .evento {
+    padding: 6px 10px;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    background: #0f172a;
+    border-left: 3px solid #38bdf8;
+  }
+  .evento.alerta { border-left-color: #ef4444; color: #fca5a5; }
+  .evento.normal { border-left-color: #22c55e; color: #86efac; }
+  .timestamp { color: #64748b; margin-right: 8px; }
+</style>
+</head>
+<body>
+  <h1>🚨 Panel de Alarma ESP32</h1>
+  <p class="subtitulo">Monitoreo de zonas en tiempo real</p>
+  <div id="estadoConexion" class="estado-conexion desconectado">
+    ⚫ Desconectado del servidor
+  </div>
+
+  <div class="grid" id="gridZonas"></div>
+
+  <div class="historial">
+    <h2>📋 Historial de Eventos</h2>
+    <div id="logEventos"></div>
+  </div>
+
+<script>
+  const NUM_ZONAS = 4;
+  const nombresZonas = [
+    "Zona 1 - Entrada",
+    "Zona 2 - Pasillo",
+    "Zona 3 - Ventana",
+    "Zona 4 - Garage"
+  ];
+  const grid = document.getElementById('gridZonas');
+  const log = document.getElementById('logEventos');
+  const estadoConexion = document.getElementById('estadoConexion');
+
+  // Crear tarjetas de zonas
+  for (let i = 0; i < NUM_ZONAS; i++) {
+    const div = document.createElement('div');
+    div.className = 'zona inactiva';
+    div.id = 'zona-' + i;
+    div.innerHTML = `
+      <h2>${nombresZonas[i]}</h2>
+      <div class="indicador">
+        <span class="led" id="led-${i}"></span>
+        <span class="etiqueta">Sensor</span>
+        <span class="valor normal" id="sensor-${i}">--</span>
+      </div>
+      <div class="indicador">
+        <span class="led" id="led-sal-${i}"></span>
+        <span class="etiqueta">Salida</span>
+        <span class="valor normal" id="salida-${i}">--</span>
+      </div>
+    `;
+    grid.appendChild(div);
+  }
+
+  function agregarEvento(msg, tipo) {
+    const ahora = new Date().toLocaleTimeString();
+    const el = document.createElement('div');
+    el.className = 'evento ' + tipo;
+    el.innerHTML = `<span class="timestamp">[${ahora}]</span>${msg}`;
+    log.prepend(el);
+    while (log.children.length > 30) log.removeChild(log.lastChild);
+  }
+
+  // ===== WebSocket =====
+  let ws;
+  function conectarWS() {
+    ws = new WebSocket('ws://' + location.hostname + ':81/');
+
+    ws.onopen = () => {
+      estadoConexion.className = 'estado-conexion conectado';
+      estadoConexion.textContent = '🟢 Conectado al servidor';
+      agregarEvento('Conexión establecida', 'normal');
+    };
+
+    ws.onclose = () => {
+      estadoConexion.className = 'estado-conexion desconectado';
+      estadoConexion.textContent = '🔴 Desconectado. Reintentando...';
+      setTimeout(conectarWS, 2000);
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        actualizarUI(data);
+      } catch(err) { console.error(err); }
+    };
+  }
+
+  let estadoAnterior = [];
+  function actualizarUI(data) {
+    for (let i = 0; i < NUM_ZONAS; i++) {
+      const zona = document.getElementById('zona-' + i);
+      const ledSensor = document.getElementById('led-' + i);
+      const ledSal = document.getElementById('led-sal-' + i);
+      const valSensor = document.getElementById('sensor-' + i);
+      const valSalida = document.getElementById('salida-' + i);
+
+      const alarmaActiva = data.zonas[i].alarma;
+      const sensorActivo = data.zonas[i].sensor;
+
+      // Tarjeta
+      zona.className = 'zona ' + (alarmaActiva ? 'activa' : 'inactiva');
+
+      // LED y valor sensor
+      ledSensor.className = 'led ' + (sensorActivo ? 'on' : 'off');
+      valSensor.textContent = sensorActivo ? 'ACTIVO' : 'Normal';
+      valSensor.className = 'valor ' + (sensorActivo ? 'alarma' : 'normal');
+
+      // LED y valor salida
+      ledSal.className = 'led ' + (alarmaActiva ? 'on' : 'off');
+      valSalida.textContent = alarmaActiva ? 'ON' : 'OFF';
+      valSalida.className = 'valor ' + (alarmaActiva ? 'alarma' : 'normal');
+
+      // Detectar cambio para el log
+      if (estadoAnterior[i] !== undefined && estadoAnterior[i] !== alarmaActiva) {
+        if (alarmaActiva) {
+          agregarEvento(`🚨 ALARMA en ${nombresZonas[i]}`, 'alerta');
+        } else {
+          agregarEvento(`✅ ${nombresZonas[i]} - Normalizado`, 'normal');
+        }
+      }
+      estadoAnterior[i] = alarmaActiva;
+    }
+  }
+
+  conectarWS();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ===== Funciones =====
+void manejarRaiz() {
+  servidorWeb.send_P(200, "text/html", PAGINA_HTML);
+}
+
+void manejarEstado() {
+  StaticJsonDocument<512> doc;
+  JsonArray zonas = doc.createNestedArray("zonas");
+  for (int i = 0; i < NUM_ZONAS; i++) {
+    JsonObject z = zonas.createNestedObject();
+    z["sensor"] = ultimaLectura[i];
+    z["alarma"] = estadoZona[i];
+    z["nombre"] = NOMBRE_ZONA[i];
+  }
+  String salida;
+  serializeJson(doc, salida);
+  servidorWeb.send(200, "application/json", salida);
+}
+
+void enviarEstadoWS() {
+  StaticJsonDocument<512> doc;
+  JsonArray zonas = doc.createNestedArray("zonas");
+  for (int i = 0; i < NUM_ZONAS; i++) {
+    JsonObject z = zonas.createNestedObject();
+    z["sensor"] = ultimaLectura[i];
+    z["alarma"] = estadoZona[i];
+    z["nombre"] = NOMBRE_ZONA[i];
+  }
+  String salida;
+  serializeJson(doc, salida);
+  webSocket.broadcastTXT(salida);
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("Cliente WS #%u conectado\n", num);
+    enviarEstadoWS();
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("Cliente WS #%u desconectado\n", num);
+  }
+}
+
+bool leerSensor(int i) {
+  bool lectura = digitalRead(PIN_SENSOR[i]);
+  if (lectura != ultimaLectura[i]) {
+    if (millis() - tUltimoCambio[i] > TIEMPO_DEBOUNCE) {
+      ultimaLectura[i] = lectura;
+      tUltimoCambio[i] = millis();
+    }
+  }
+  return ultimaLectura[i];
+}
+
+void activarAlarma(int i) {
+  estadoZona[i] = true;
+  tInicioAlarma[i] = millis();
+  digitalWrite(PIN_SALIDA[i], HIGH);
+  Serial.printf(">>> ALARMA en %s\n", NOMBRE_ZONA[i]);
+  enviarEstadoWS();
+}
+
+void desactivarAlarma(int i) {
+  estadoZona[i] = false;
+  digitalWrite(PIN_SALIDA[i], LOW);
+  Serial.printf("<<< Normalizada %s\n", NOMBRE_ZONA[i]);
+  enviarEstadoWS();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== Sistema de Alarma ESP32 ===");
+
+  // Configurar pines
+  for (int i = 0; i < NUM_ZONAS; i++) {
+    pinMode(PIN_SENSOR[i], INPUT_PULLUP);
+    pinMode(PIN_SALIDA[i], OUTPUT);
+    digitalWrite(PIN_SALIDA[i], LOW);
+    ultimaLectura[i] = digitalRead(PIN_SENSOR[i]);
+  }
+
+  // Conectar WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Conectando WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✓ WiFi conectado");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Rutas HTTP
+  servidorWeb.on("/", manejarRaiz);
+  servidorWeb.on("/estado", manejarEstado);
+  servidorWeb.begin();
+
+  // WebSocket
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+
+  Serial.println("Servidor web iniciado en puerto 80");
+  Serial.println("WebSocket en puerto 81");
+}
+
+void loop() {
+  servidorWeb.handleClient();
+  webSocket.loop();
+
+  // Revisar cada zona
+  for (int i = 0; i < NUM_ZONAS; i++) {
+    bool lectura = leerSensor(i);
+
+    if (lectura && !estadoZona[i]) {
+      activarAlarma(i);
+    }
+
+    if (estadoZona[i] && (millis() - tInicioAlarma[i] >= TIEMPO_ALARMA)) {
+      desactivarAlarma(i);
+    }
+  }
+
+  // Enviar estado periódico (cada 1 segundo) para sincronizar
+  static unsigned long ultimoEnvio = 0;
+  if (millis() - ultimoEnvio > 1000) {
+    enviarEstadoWS();
+    ultimoEnvio = millis();
+  }
+}
